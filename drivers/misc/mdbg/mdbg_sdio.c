@@ -33,7 +33,6 @@ static struct wake_lock  mdbg_wake_lock;
 /*******************************************************/
 /***********Local Functions Declaration************/
 /*******************************************************/
-LOCAL void mdbg_sdio_read(void);
 LOCAL MDBG_SIZE_T mdbg_sdio_write(char* buff, MDBG_SIZE_T len,uint32 chn);
 
 /*******************************************************/
@@ -73,6 +72,31 @@ PUBLIC void mdbg_sdio_remove(void)
 	}
 }
 
+void mdbg_sdio_read(void)
+{
+	wake_lock(&mdbg_wake_lock);
+	mutex_lock(&mdbg_read_mutex);
+	//set_marlin_wakeup(MDBG_CHANNEL_READ,0x1);
+	sdio_read_len = sdio_dev_get_chn_datalen(MDBG_CHANNEL_READ);
+	if(sdio_read_len <= 0)
+	{
+		MDBG_ERR("[%s][%d]\n",__func__, sdio_read_len);
+		wake_unlock(&mdbg_wake_lock);
+		mutex_unlock(&mdbg_read_mutex);
+		return;
+	}
+	sdio_dev_read(MDBG_CHANNEL_READ,mdbg_rx_buff,&sdio_read_len);
+	sdio_read_len = mdbg_ring_write(rx_ring,mdbg_rx_buff, sdio_read_len);
+	mdbg_read_count += sdio_read_len;
+	wake_up_interruptible(&mdbg_wait);
+	wake_up_interruptible(&mdbg_dev->rxwait);
+
+	wake_unlock(&mdbg_wake_lock);
+	mutex_unlock(&mdbg_read_mutex);
+	return;
+}
+EXPORT_SYMBOL_GPL(mdbg_sdio_read);
+
 int mdbg_channel_init(void)
 {
 	int err = 0;
@@ -110,31 +134,6 @@ LOCAL MDBG_SIZE_T mdbg_sdio_write(char* buff, MDBG_SIZE_T len,uint32 chn)
 	sdio_dev_write(chn, buff, len);
 	return len;
 }
-
-PUBLIC void mdbg_sdio_read(void)
-{
-	wake_lock(&mdbg_wake_lock);
-	mutex_lock(&mdbg_read_mutex);
-	//set_marlin_wakeup(MDBG_CHANNEL_READ,0x1);
-	sdio_read_len = sdio_dev_get_chn_datalen(MDBG_CHANNEL_READ);
-	if(sdio_read_len <= 0)
-	{
-		MDBG_ERR("[%s][%d]\n",__func__, sdio_read_len);
-		wake_unlock(&mdbg_wake_lock);
-		mutex_unlock(&mdbg_read_mutex);
-		return;
-	}
-	sdio_dev_read(MDBG_CHANNEL_READ,mdbg_rx_buff,&sdio_read_len);
-	sdio_read_len = mdbg_ring_write(rx_ring,mdbg_rx_buff, sdio_read_len);
-	mdbg_read_count += sdio_read_len;
-	wake_up_interruptible(&mdbg_wait);
-	wake_up_interruptible(&mdbg_dev->rxwait);
-
-	wake_unlock(&mdbg_wake_lock);
-	mutex_unlock(&mdbg_read_mutex);
-	return;
-}
-EXPORT_SYMBOL_GPL(mdbg_sdio_read);
 
 /*******************************************************/
 /**************MDBG IO Functions******************/
