@@ -131,3 +131,10 @@ config SECURITY_SELINUX_POLICYDB_VERSION_MAX_VALUE
 	  installed under /etc/selinux/$SELINUXTYPE/policy, where
 	  SELINUXTYPE is defined in your /etc/selinux/config.
 
+config ALWAYS_ENFORCE
+	bool "Always Enforcing SELinux"
+	default n
+	help
+	  This option will force kernel to always enforcing
+
+	  If you are unsure how to answer this question, answer N.
