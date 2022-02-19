@@ -51,7 +51,6 @@
 #define ST_LOG(fmt,...)
 #endif
 
-
 /* If the device is not responding */
 #define MMC_CORE_TIMEOUT_MS	(10 * 60 * 1000) /* 10 minute timeout */
 
@@ -62,7 +61,7 @@
 #define MMC_BKOPS_MAX_TIMEOUT	(4 * 60 * 1000) /* max time to wait in ms */
 
 static struct workqueue_struct *workqueue;
-static const unsigned freqs[] = { 400000, 300000, 200000, 100000 };
+static const unsigned freqs[] = { 400000,100000 };
 
 /*
  * Enabling software CRCs on the data blocks can be a significant (30%)
@@ -338,8 +337,11 @@ EXPORT_SYMBOL(mmc_start_bkops);
  */
 static void mmc_wait_data_done(struct mmc_request *mrq)
 {
+	unsigned long flags;
+	spin_lock_irqsave(&mrq->host->context_info.lock,flags);
 	mrq->host->context_info.is_done_rcv = true;
 	wake_up_interruptible(&mrq->host->context_info.wait);
+	spin_unlock_irqrestore(&mrq->host->context_info.lock,flags);
 }
 
 static void mmc_wait_done(struct mmc_request *mrq)
@@ -1237,11 +1239,11 @@ int mmc_regulator_set_ocr(struct mmc_host *mmc,
 		 */
 		tmp = vdd_bit - ilog2(MMC_VDD_165_195);
 		if (tmp == 0) {
-			min_uV = 1650 * 1000;
-			max_uV = 1950 * 1000;
+			min_uV = 1800 * 1000;
+			max_uV = min_uV;
 		} else {
 			min_uV = 1900 * 1000 + tmp * 100 * 1000;
-			max_uV = min_uV + 100 * 1000;
+			max_uV = min_uV ;
 		}
 
 		/*
@@ -1265,7 +1267,8 @@ int mmc_regulator_set_ocr(struct mmc_host *mmc,
 			if (!result)
 				mmc->regulator_enabled = true;
 		}
-	} else if (mmc->regulator_enabled) {
+	} else {
+		printk("mmc_regulator_set_ocr regulator_disable\n");
 		result = regulator_disable(supply);
 		if (result == 0)
 			mmc->regulator_enabled = false;
@@ -1554,8 +1557,9 @@ void mmc_power_off(struct mmc_host *host)
 	 * XO-1.5, require a short delay after poweroff before the card
 	 * can be successfully turned on again.
 	 */
+	#if 0 /*for decrease suspend time*/
 	mmc_delay(1);
-
+	#endif
 	mmc_host_clk_release(host);
 }
 
@@ -1563,7 +1567,7 @@ void mmc_power_cycle(struct mmc_host *host)
 {
 	mmc_power_off(host);
 	/* Wait at least 1 ms according to SD spec */
-	mmc_delay(1);
+	mmc_delay(300);
 	mmc_power_up(host);
 }
 
@@ -1614,10 +1618,6 @@ int mmc_resume_bus(struct mmc_host *host)
 		return -EINVAL;
 
 	printk("%s: Starting deferred resume\n", mmc_hostname(host));
-	spin_lock_irqsave(&host->lock, flags);
-	host->bus_resume_flags &= ~MMC_BUSRESUME_NEEDS_RESUME;
-	host->rescan_disable = 0;
-	spin_unlock_irqrestore(&host->lock, flags);
 
 	mmc_bus_get(host);
 	if (host->bus_ops && !host->bus_dead) {
@@ -1625,11 +1625,16 @@ int mmc_resume_bus(struct mmc_host *host)
 		BUG_ON(!host->bus_ops->resume);
 		host->bus_ops->resume(host);
 	}
-
-	if (host->bus_ops->detect && !host->bus_dead)
-		host->bus_ops->detect(host);
+	spin_lock_irqsave(&host->lock, flags);
+	host->bus_resume_flags &= ~MMC_BUSRESUME_NEEDS_RESUME;
+	host->rescan_disable = 0;
+	spin_unlock_irqrestore(&host->lock, flags);
 
 	mmc_bus_put(host);
+
+	/*card detection can not be called whithin dfferent task, it may cause some tasks  to remove card at the same time*/
+	mmc_detect_change(host, 0);
+
 	printk("%s: Deferred resume completed\n", mmc_hostname(host));
 	return 0;
 }
@@ -2077,7 +2082,8 @@ int mmc_can_sanitize(struct mmc_card *card)
 {
 	if (!mmc_can_trim(card) && !mmc_can_erase(card))
 		return 0;
-	if (card->ext_csd.sec_feature_support & EXT_CSD_SEC_SANITIZE)
+	if ((card->ext_csd.sec_feature_support & EXT_CSD_SEC_SANITIZE)
+			&& (card->host->caps2 & MMC_CAP2_SANITIZE))
 		return 1;
 	return 0;
 }
@@ -2206,7 +2212,7 @@ int mmc_set_blockcount(struct mmc_card *card, unsigned int blockcount,
 }
 EXPORT_SYMBOL(mmc_set_blockcount);
 
-static void mmc_hw_reset_for_init(struct mmc_host *host)
+void mmc_hw_reset_for_init(struct mmc_host *host)
 {
 	if (!(host->caps & MMC_CAP_HW_RESET) || !host->ops->hw_reset)
 		return;
@@ -2214,16 +2220,10 @@ static void mmc_hw_reset_for_init(struct mmc_host *host)
 	host->ops->hw_reset(host);
 	mmc_host_clk_release(host);
 }
+EXPORT_SYMBOL(mmc_hw_reset_for_init);
 
 int mmc_can_reset(struct mmc_card *card)
 {
-	u8 rst_n_function;
-
-	if (!mmc_card_mmc(card))
-		return 0;
-	rst_n_function = card->ext_csd.rst_n_function;
-	if ((rst_n_function & EXT_CSD_RST_N_EN_MASK) != EXT_CSD_RST_N_ENABLED)
-		return 0;
 	return 1;
 }
 EXPORT_SYMBOL(mmc_can_reset);
@@ -2231,6 +2231,8 @@ EXPORT_SYMBOL(mmc_can_reset);
 static int mmc_do_hw_reset(struct mmc_host *host, int check)
 {
 	struct mmc_card *card = host->card;
+
+	printk("%s: mmc_do_hw_reset \n", mmc_hostname(host));
 
 	if (!host->bus_ops->power_restore)
 		return -EOPNOTSUPP;
@@ -2308,7 +2310,8 @@ static int mmc_rescan_try_freq(struct mmc_host *host, unsigned freq)
 	 * Some eMMCs (with VCCQ always on) may not be reset after power up, so
 	 * do a hardware reset if possible.
 	 */
-	mmc_hw_reset_for_init(host);
+	if (host->caps & MMC_CAP_NONREMOVABLE)
+		mmc_hw_reset_for_init(host);
 
 	/*
 	 * sdio_reset sends CMD52 to reset card.  Since we do not know
@@ -2408,12 +2411,16 @@ void mmc_rescan(struct work_struct *work)
 	int i;
 	bool extend_wakelock = false;
 
-	if (host->rescan_disable)
+	if (host->rescan_disable) {
+		wake_unlock(&host->detect_wake_lock);
 		return;
+	}
 
 	/* If there is a non-removable card registered, only scan once */
-	if ((host->caps & MMC_CAP_NONREMOVABLE) && host->rescan_entered)
+	if ((host->caps & MMC_CAP_NONREMOVABLE) && host->rescan_entered) {
+		wake_unlock(&host->detect_wake_lock);
 		return;
+	}
 	host->rescan_entered = 1;
 
 	mmc_bus_get(host);
@@ -2461,6 +2468,7 @@ void mmc_rescan(struct work_struct *work)
 	}
 
 	ST_LOG("<%s> %s insertion detected",__func__,host->class_dev.kobj.name);
+
 	mmc_claim_host(host);
 	for (i = 0; i < ARRAY_SIZE(freqs); i++) {
 		if (!mmc_rescan_try_freq(host, max(freqs[i], host->f_min))) {
@@ -2690,6 +2698,21 @@ int mmc_cache_ctrl(struct mmc_host *host, u8 enable)
 }
 EXPORT_SYMBOL(mmc_cache_ctrl);
 
+#ifdef CONFIG_BCM43454
+void mmc_ctrl_power(struct mmc_host *host, bool onoff)
+{
+	mmc_claim_host(host);
+	if (onoff)
+		mmc_power_up(host);
+	else
+		mmc_power_off(host);
+	/* Wait at least 1 ms according to SD spec */
+	mmc_delay(1);
+	mmc_release_host(host);
+}
+EXPORT_SYMBOL(mmc_ctrl_power);
+#endif /* CONFIG_BCM43454 */
+
 #ifdef CONFIG_PM
 
 /**
@@ -2862,6 +2885,81 @@ int mmc_pm_notify(struct notifier_block *notify_block,
 	return 0;
 }
 #endif
+
+#define MIN_WAIT_MS	5
+static int mmc_wait_trans_state(struct mmc_card *card, unsigned int wait_ms)
+{
+	int waited = 0;
+	int status = 0;
+
+	mmc_send_status(card, &status);
+
+	while (R1_CURRENT_STATE(status) != R1_STATE_TRAN) {
+		if (waited > wait_ms)
+			return 0;
+		mdelay(MIN_WAIT_MS);
+		waited += MIN_WAIT_MS;
+		mmc_send_status(card, &status);
+	}
+	return waited;
+}
+
+/*
+ * Turn the bkops mode ON/OFF.
+ */
+int mmc_bkops_enable(struct mmc_host *host, u8 value)
+{
+	struct mmc_card *card = host->card;
+	unsigned long flags;
+	int err = 0;
+	u8 ext_csd[512];
+
+	if (!card)
+		return err;
+
+	mmc_claim_host(host);
+
+	/* read ext_csd to get EXT_CSD_BKOPS_EN field value */
+	err = mmc_send_ext_csd(card, ext_csd);
+	if (err) {
+		mmc_wait_trans_state(card, 100);
+		err = mmc_send_ext_csd(card, ext_csd);
+		if (err) {
+			pr_err("%s: error %d sending ext_csd\n",
+					mmc_hostname(card->host), err);
+			goto bkops_out;
+		}
+	}
+
+	/* set value to put EXT_CSD_BKOPS_EN field */
+	value |= ext_csd[EXT_CSD_BKOPS_EN] & 0x1;
+	err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+			EXT_CSD_BKOPS_EN, value,
+			card->ext_csd.generic_cmd6_time);
+	if (err) {
+		pr_err("%s: bkops mode error %d\n", mmc_hostname(host), err);
+		goto bkops_out;
+	}
+
+	/* read ext_csd again to get EXT_CSD_BKOPS_EN field value */
+	mmc_wait_trans_state(card, 20);
+	err = mmc_send_ext_csd(card, ext_csd);
+
+	if (!err) {
+		spin_lock_irqsave(&card->bkops_lock, flags);
+		card->bkops_enable = ext_csd[EXT_CSD_BKOPS_EN];
+		spin_unlock_irqrestore(&card->bkops_lock, flags);
+	} else {
+		pr_err("%s: error %d confirming ext_csd value\n",
+				mmc_hostname(card->host), err);
+	}
+
+bkops_out:
+	mmc_release_host(host);
+
+	return err;
+}
+EXPORT_SYMBOL(mmc_bkops_enable);
 
 /**
  * mmc_init_context_info() - init synchronization context
